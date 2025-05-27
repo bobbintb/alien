@@ -112,108 +112,83 @@ sub scan {
 
 	# Attempt to extract slack-desc
 	my $slack_desc_content = $this->runpipe(1, "tar Oxf '$file' install/slack-desc 2>/dev/null");
+	my $pkg_name = $this->name(); # Get package name early
 
 	if ($slack_desc_content && $slack_desc_content =~ /\S/) {
-		my @lines = split /\n/, $slack_desc_content;
-		my $pkg_name = $this->name();
-		my $original_first_line = $lines[0]; # Keep a copy for potential description use
-		my $summary_line_processed = 0;
-
-		# Try to parse summary from the first line
-		if (@lines && $lines[0] =~ /^$pkg_name:\s*$pkg_name\s*\((.+)\)\s*$/) {
-			$this->summary($1);
-			shift @lines; # Remove the processed summary line
-			$summary_line_processed = 1;
-		} elsif (@lines && $lines[0] =~ /^$pkg_name:\s*(.+)$/) {
-			my $potential_summary = $1;
-			if (length($potential_summary) < 100 && $potential_summary !~ /^[A-Z ]{5,}:\s*.*/) { # Avoid long lines or typical headers
-				$this->summary($potential_summary);
-				shift @lines; # Remove the processed summary line
-				$summary_line_processed = 1;
-			} else {
-				$this->summary("Converted tgz package");
-			}
-		} else {
-			$this->summary("Converted tgz package");
-		}
-
-		my @description_lines;
-		my $pkg_name_prefix_regex = qr/^\Q$pkg_name\E:\s*/;
-		# Regex for typical headers in slack-desc, case-insensitive for key
-		# Matches "KEY:", "KEY WORDS:"
-		my $header_regex = qr/^([A-Z][A-Z\s()]+):\s*.*/i;
-
-		my @temp_lines_for_desc;
-		if (!$summary_line_processed && $original_first_line) {
-		    # If first line was not used for summary, add it to the pool of lines for description processing
-		    @temp_lines_for_desc = ($original_first_line, @lines);
-		} else {
-		    @temp_lines_for_desc = @lines;
-		}
+		my @slack_lines = split /\n/, $slack_desc_content;
 		
-		foreach my $line (@temp_lines_for_desc) {
-			my $cleaned_line = $line;
-			$cleaned_line =~ s/$pkg_name_prefix_regex//;
+		# Default values if parsing fails or parts are missing
+		my $default_summary_text = "Package from tgz file (slack-desc found)";
+		my $default_description_text = "Package from tgz file (slack-desc found)";
+		$this->summary($default_summary_text);
+		$this->description($default_description_text);
 
-			if ($cleaned_line =~ $header_regex) {
-				# Check if the part before colon looks like a standard header key
-				my $header_key = $1;
-				my @standard_headers = ("PACKAGE NAME", "PACKAGE LOCATION", "PACKAGE SIZE (COMPRESSED)", 
-				                        "PACKAGE SIZE (UNCOMPRESSED)", "PACKAGE REQUIRED", "PACKAGE SUGGESTS", 
-				                        "PACKAGE CONFLICTS", "PACKAGE PROVIDES", "PACKAGE TAGS");
-				my $is_standard_header = 0;
-				foreach my $sh (@standard_headers) {
-				    if (uc($header_key) eq $sh) {
-				        $is_standard_header = 1;
-				        last;
-				    }
-				}
-				if ($is_standard_header) {
-				    next; # Skip standard header lines
+		my $summary_parsed_successfully = 0;
+
+		if (@slack_lines) {
+			my $first_line = $slack_lines[0]; # Peek at first line
+			# Try to parse summary from the first line using the strict format
+			if ($first_line =~ /^\Q$pkg_name\E: \Q$pkg_name\E \((.+)\)\s*$/) {
+				my $summary_candidate = $1;
+				if ($summary_candidate =~ /\S/) { # Check if captured summary is not just whitespace
+					$this->summary($summary_candidate);
+					$this->description($summary_candidate); # Initial guess for description
+					shift @slack_lines; # Consume the line as it was successfully parsed
+					$summary_parsed_successfully = 1;
 				}
 			}
-			
-			if ($line eq $pkg_name.":" || $line eq $pkg_name.": ") {
-			    push @description_lines, ""; 
+		}
+		
+		# Description Parsing from remaining lines (or all lines if summary parse failed)
+		my @description_parts;
+		my $expected_prefix_regex = qr/^\Q$pkg_name\E: /; # $pkg_name: <text>
+		my $paragraph_break_regex = qr/^\Q$pkg_name\E:$/;  # $pkg_name:
+
+		foreach my $line (@slack_lines) {
+			if ($line =~ $paragraph_break_regex) {
+				push @description_parts, ""; # Paragraph break
+			} elsif ((my $desc_content = $line) =~ s/$expected_prefix_regex//) {
+				# Prefix was stripped, $desc_content now holds the rest
+				push @description_parts, $desc_content;
 			} else {
-			    push @description_lines, $cleaned_line;
+				# Line does not match strict format, ignore it for description.
+				# This handles cases where the first line was not a valid summary
+				# and is now being re-evaluated here but doesn't fit description format either.
 			}
 		}
 
-		# Remove leading/trailing empty lines from the description block
-		while (@description_lines && $description_lines[0] !~ /\S/) {
-		    shift @description_lines;
-		}
-		while (@description_lines && $description_lines[-1] !~ /\S/) {
-		    pop @description_lines;
-		}
+		if (@description_parts) {
+			my $parsed_description = join("\n", @description_parts);
+			# Remove leading/trailing empty lines from the final description block
+			$parsed_description =~ s/^\n+//;
+			$parsed_description =~ s/\n+$/\n/; # Keep single trailing newline if content, or make it one if many
+            $parsed_description =~ s/\s+$//; # Trim trailing whitespace overall, including last newline if it was just that
 
-		my $final_description = join("\n", @description_lines);
-
-		if ($final_description =~ /\S/) {
-			$this->description($final_description);
-		} else {
-			# Fallback if description is empty after parsing
-			# If summary was also default, this keeps the original fallback
-			$this->description($this->summary()); 
-		}
-		
-		# Refine summary if it's still default but we have a good description
-		if ($this->summary() eq "Converted tgz package" && $final_description =~ /\S/ && $this->description() ne "Converted tgz package") {
-		    my ($first_desc_line) = split /\n/, $final_description;
-		    # Ensure first_desc_line is not empty and is reasonably short for a summary
-		    if ($first_desc_line && $first_desc_line =~ /\S/ && length($first_desc_line) < 100 && length($first_desc_line) > 5) { 
-		        $this->summary($first_desc_line);
-		    }
-		}
-		# If description is multi-line but summary is identical to the whole description, try to shorten summary.
-		if (index($this->description(), "\n") != -1 && $this->summary() eq $this->description()) {
-		    my ($first_desc_line) = split /\n/, $this->description();
-		     if ($first_desc_line && $first_desc_line =~ /\S/ && length($first_desc_line) < 100 && length($first_desc_line) > 5) {
-		        $this->summary($first_desc_line);
-		     }
-		}
-
+			if ($parsed_description =~ /\S/) {
+				$this->description($parsed_description);
+				# If summary is still the generic default, but we have a description,
+				# try to set summary from the first line of this description.
+				if ($this->summary() eq $default_summary_text) {
+					my ($first_desc_line) = split /\n/, $parsed_description;
+					if ($first_desc_line && length($first_desc_line) < 100 && $first_desc_line =~ /\S/) {
+						$this->summary($first_desc_line);
+					}
+				}
+			} else {
+			    # Description parts were found but resulted in an empty string (e.g. only paragraph markers)
+			    # Revert to summary if summary was good, or default if summary was also default.
+			    if ($summary_parsed_successfully) {
+			        $this->description($this->summary());
+			    } else {
+			        $this->description($default_description_text); # Keep default
+			    }
+			}
+		} elsif (!$summary_parsed_successfully) {
+            # No description parts AND summary was not parsed successfully means slack-desc was
+            # present but entirely unparsable or empty after the first line (if any).
+            # Summary and Description remain $default_summary_text.
+        }
+        # If summary was parsed but no description lines, description is already set to summary.
 
 	} else {
 		# Original behavior if slack-desc is not found or empty
@@ -286,115 +261,159 @@ sub unpack {
 	return 1;
 }
 
+# Helper function for _format_slack_desc
+sub _format_slack_desc_section {
+    my ($pkgname, $text_content, $num_target_lines, $max_total_line_length) = @_;
+
+    my $line_prefix_with_space = "$pkgname: ";
+    my $line_prefix_no_space = "$pkgname:";
+    # Max length for the actual content, after the prefix
+    my $max_content_len = $max_total_line_length - length($line_prefix_with_space);
+    # Ensure max_content_len is somewhat reasonable if pkgname is very long
+    $max_content_len = 10 if $max_content_len < 10;
+
+    my @formatted_lines;
+    $text_content = "" if !defined $text_content; # Ensure defined
+
+    my @segments = split /\n/, $text_content;
+    # If text_content was empty, split results in one empty segment.
+    # If text_content ended with \n, split might produce an extra empty segment.
+    # We want to preserve intentional paragraph breaks (empty segments from \n\n).
+    
+    # Special case: if text_content is completely empty, segments will be [""]
+    # and num_target_lines is 1, it should produce one "$pkgname:" line.
+    # If text_content is non-empty but results in no words (e.g. "  \n  "),
+    # it should also be handled gracefully.
+
+    SEGMENT: foreach my $segment (@segments) {
+        last SEGMENT if scalar(@formatted_lines) >= $num_target_lines;
+
+        # Trim whitespace from segment. If it becomes empty, it's a paragraph break.
+        $segment =~ s/^\s+|\s+$//g;
+
+        if ($segment eq "") {
+            push @formatted_lines, $line_prefix_no_space;
+            next SEGMENT;
+        }
+
+        my @words = split /\s+/, $segment;
+        next SEGMENT if !@words; # Should not happen if segment was non-empty after trim
+
+        my $current_line_buffer = ""; # Holds content part of the line
+
+        WORD: foreach my $word (@words) {
+            if (scalar(@formatted_lines) >= $num_target_lines && $current_line_buffer eq "") {
+                 # Already filled target lines and current buffer for this segment is empty
+                last SEGMENT;
+            }
+            # Check if a single word itself is too long
+            if (length($word) > $max_content_len) {
+                # If buffer has content, push it first
+                if ($current_line_buffer ne "") {
+                    last SEGMENT if scalar(@formatted_lines) >= $num_target_lines;
+                    push @formatted_lines, $line_prefix_with_space . $current_line_buffer;
+                    $current_line_buffer = "";
+                }
+                # Push the long word, truncated, on its own line
+                last SEGMENT if scalar(@formatted_lines) >= $num_target_lines;
+                push @formatted_lines, $line_prefix_with_space . substr($word, 0, $max_content_len);
+                # The rest of the word is lost, as per typical shell script behavior (often implicit)
+                # Or, decide if $word should become the remainder: $word = substr($word, $max_content_len); and re-evaluate
+                # For now, simply truncating and moving to next word in input.
+                # Given the spec, it's more about fitting, so a very long word will just fill one line.
+                next WORD; # Move to next word, current long word handled.
+            }
+
+            if ($current_line_buffer eq "") {
+                $current_line_buffer = $word;
+            } else {
+                my $potential_line = $current_line_buffer . " " . $word;
+                if (length($potential_line) <= $max_content_len) {
+                    $current_line_buffer = $potential_line;
+                } else {
+                    last SEGMENT if scalar(@formatted_lines) >= $num_target_lines;
+                    push @formatted_lines, $line_prefix_with_space . $current_line_buffer;
+                    $current_line_buffer = $word;
+                }
+            }
+        }# end WORD loop
+        
+        # Push any remaining content in buffer for the current segment
+        if ($current_line_buffer ne "") {
+            last SEGMENT if scalar(@formatted_lines) >= $num_target_lines;
+            push @formatted_lines, $line_prefix_with_space . $current_line_buffer;
+        }
+
+    } # end SEGMENT loop
+
+    # Pad with "$pkgname:" or truncate to meet exactly $num_target_lines
+    while (scalar(@formatted_lines) < $num_target_lines) {
+        push @formatted_lines, $line_prefix_no_space;
+    }
+    if (scalar(@formatted_lines) > $num_target_lines) {
+        @formatted_lines = @formatted_lines[0 .. $num_target_lines - 1];
+    }
+
+    return @formatted_lines;
+}
+
 sub _format_slack_desc {
 	my $this = shift;
 
-	my $pkg_name = $this->name() || "unknown";
-	my $version = $this->version() || "0.0";
-	my $arch = $this->arch();
-	$arch = 'noarch' if !$arch || $arch eq 'all'; # Slackware often uses 'noarch'
-	my $release = $this->release() || "1"; # Default release
+	my $pkgname = $this->name() || "unknown"; # Should usually be defined
+	my $summary = $this->summary();
+	my $description = $this->description();
+	my $homepage_url = ""; # Fixed as per requirement
+
+	# Ensure summary is a single, trimmed line
+	$summary = "" if !defined $summary;
+	$summary =~ s/\n.*//s;    # Keep only the first line
+	$summary =~ s/^\s+|\s+$//g; # Trim whitespace
+	$summary = "No summary" if $summary eq "";
+
+
+	$description = "" if !defined $description;
+    # Newlines in description are paragraph separators, handled by _format_slack_desc_section
+
+	my $screen_width = 72 + length($pkgname);
+
+	my $ruler_header = "# HOW TO EDIT THIS FILE:\n# The \"handy ruler\" below makes it easier to edit a package description.\n# Line up the first '|' above the ':' following the base package name, and\n# the '|' on the right side marks the last column you can put a character in.\n# You must make exactly 11 lines for the formatting to be correct.  It's also\n# customary to leave one space after the ':' except on otherwise blank lines.\n\n";
 	
-	my $summary_text = $this->summary() || "No summary available.";
-	# Remove "Converted tgz package" if it's still the summary and a better one wasn't found
-	if ($summary_text eq "Converted tgz package" && $this->description() && $this->description() ne "Converted tgz package") {
-	    my ($first_desc_line) = split /\n/, $this->description();
-	    if ($first_desc_line && length($first_desc_line) < 100 && length($first_desc_line) > 5) {
-	        $summary_text = $first_desc_line;
-	    }
-	}
-	# Ensure summary doesn't contain newlines for the header line
-	$summary_text =~ s/\n.*//s;
+	my $ruler_gap = ' ' x length($pkgname);
+	my $ruler_base = $ruler_gap . "|-----handy-ruler--";
+	# Screen width is total, ruler includes the final '|', so -1 from screen_width for filling
+	my $ruler_fill_count = $screen_width - 1 - length($ruler_base);
+	$ruler_fill_count = 0 if $ruler_fill_count < 0; # Ensure not negative
+	my $ruler_line = $ruler_base . ('-' x $ruler_fill_count) . '|';
+
+	my $complete_ruler_block = $ruler_header . $ruler_line . "\n";
+
+	# Section 1: Summary (1 line)
+	# The format "$pkgname ($summary)" is part of the text_content for this section
+	my $summary_content_for_section = "$pkgname ($summary)";
+	my @summary_section = _format_slack_desc_section($pkgname, $summary_content_for_section, 1, $screen_width);
+
+	# Section 2: Empty line (1 line)
+	# This is effectively an empty paragraph
+	my @empty_section = _format_slack_desc_section($pkgname, "", 1, $screen_width);
+    # Ensure it's just "$pkgname:" as per spec for empty lines
+    $empty_section[0] = "$pkgname:" if @empty_section;
 
 
-	my $description_text = $this->description() || "No detailed description available.";
-	if ($description_text eq $summary_text && $summary_text eq "Converted tgz package") {
-	    $description_text = "This is a tgz package converted by alien."; # A bit more descriptive default
-	}
+	# Section 3: Description (8 lines)
+	my @description_section = _format_slack_desc_section($pkgname, $description, 8, $screen_width);
+
+	# Section 4: Homepage (1 line)
+	my @homepage_section = _format_slack_desc_section($pkgname, $homepage_url, 1, $screen_width);
+    # Ensure it's just "$pkgname:" if homepage_url is empty
+    if ($homepage_url eq "" && @homepage_section) {
+        $homepage_section[0] = "$pkgname:";
+    }
 
 
-	my $filename = "$pkg_name-$version-$arch-$release.tgz";
-
-	my $header = <<'EOF';
-# HOW TO EDIT THIS FILE:
-# The script REGENERATES this file description from the files
-# contents in the package. For this reason, you should edit
-# the files contents BEFORE running the package generator.
-#
-# The file is a standard slack-desc file. It contains a
-# description of the package. It will be installed in
-# /var/log/packages/ and can be viewed using pkgtool.
-#
-# Lines that begin with '#' are comments and will be ignored.
-# The first non-comment line should be the package name,
-# version, and a short description, formatted like this:
-#
-#<pkgname>: <pkgname> (This is a short description of the package)
-#
-# The rest of the lines are a more detailed description of the
-# package. They should be formatted like this:
-#
-#<pkgname>: This is a line of the detailed description. All lines
-#<pkgname>: of the description should be prefixed with the
-#<pkgname>: package name, followed by a colon and a space.
-#<pkgname>:
-#<pkgname>: This is another paragraph of the description.
-#
-EOF
-	chomp $header; # Remove trailing newline from heredoc
-
-	my @slack_desc_lines;
-	push @slack_desc_lines, $header;
-	push @slack_desc_lines, ""; # Empty line after header
-	push @slack_desc_lines, "PACKAGE NAME: $filename";
-	push @slack_desc_lines, "PACKAGE LOCATION: ./";
-	# Other PACKAGE fields like SIZE could be added here if available
-	push @slack_desc_lines, ""; # Empty line before main description
-
-	# Summary line
-	push @slack_desc_lines, "$pkg_name: $pkg_name ($summary_text)";
+	my $all_content_lines = join("\n", @summary_section, @empty_section, @description_section, @homepage_section);
 	
-	# Description lines
-	my @desc_paras = split /\n/, $description_text; # Simple split, treat each line as a potential paragraph start for now
-                                                    # More sophisticated paragraph handling might be needed if original desc has \n\n
-
-	my $line_prefix = "$pkg_name: ";
-	my $max_len = 72; # Target maximum line length for slack-desc
-
-	if (!@desc_paras || (@desc_paras == 1 && $desc_paras[0] eq $summary_text) || $description_text eq "No detailed description available." || $description_text eq "This is a tgz package converted by alien.") {
-	    # If description is same as summary or default, add a generic line or two.
-	    if ($description_text ne $summary_text) { # only add if not redundant with summary line
-	        push @slack_desc_lines, "$line_prefix"; # Empty paragraph line
-	        push @slack_desc_lines, $line_prefix . $description_text;
-	    }
-	} else {
-	    push @slack_desc_lines, "$line_prefix"; # Start with an empty paragraph line after summary.
-	    foreach my $para_line (@desc_paras) {
-	        if ($para_line =~ /^\s*$/) { # Original empty line, treat as paragraph separator
-	            push @slack_desc_lines, $line_prefix;
-	            next;
-	        }
-
-	        my $current_line = $line_prefix . $para_line;
-	        while (length($current_line) > $max_len) {
-	            my $breakpoint = -1;
-	            # Try to find a space to break at, within the allowed length
-	            # Search backwards from $max_len - length($line_prefix) in the non-prefixed part
-	            my $search_part = substr($current_line, length($line_prefix), $max_len - length($line_prefix));
-	            $breakpoint = rindex($search_part, ' ');
-
-	            if ($breakpoint > 0) { # Found a space
-	                push @slack_desc_lines, substr($current_line, 0, length($line_prefix) + $breakpoint);
-	                $current_line = $line_prefix . substr($current_line, length($line_prefix) + $breakpoint + 1);
-	            } else { # No space found, hard break (should be rare with typical text)
-	                push @slack_desc_lines, substr($current_line, 0, $max_len);
-	                $current_line = $line_prefix . substr($current_line, $max_len);
-	            }
-	        }
-	        push @slack_desc_lines, $current_line; # Add the remainder or the full line if it was short enough
-	    }
-	}
-	return join("\n", @slack_desc_lines) . "\n"; # Ensure trailing newline
+	return $complete_ruler_block . $all_content_lines . "\n";
 }
 
 =item prep
@@ -459,11 +478,17 @@ Build a tgz.
 
 sub build {
 	my $this=shift;
-	my $tgz=$this->name."-".$this->version.".tgz";
-
-	$this->do("cd ".$this->unpacked_tree."; tar czf ../$tgz .")
-		or die "Package build failed";
-
+	my $tgz=$this->name."-".$this->version."-".$this->arch."-1_alien.tgz";
+	if (-x "/sbin/makepkg") {
+		my $v=$Alien::Package::verbose;
+		$Alien::Package::verbose=2;
+		$this->do("cd ".$this->unpacked_tree."; makepkg -l y -c n ../$tgz .")
+			or die "Unable to make pkg";
+		$Alien::Package::verbose=$v;
+	}
+	else {
+		die "Sorry, I cannot generate the .tgz file because /sbin/makepkg is not present.\n"
+	}
 	return $tgz;
 }
 
