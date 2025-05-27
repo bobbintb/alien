@@ -287,81 +287,97 @@ sub _format_slack_desc_section {
     my @formatted_lines;
     $text_content = "" if !defined $text_content; # Ensure defined
 
-    my @segments = split /\n/, $text_content;
-    # If text_content was empty, split results in one empty segment.
-    # If text_content ended with \n, split might produce an extra empty segment.
-    # We want to preserve intentional paragraph breaks (empty segments from \n\n).
-    
-    # Special case: if text_content is completely empty, segments will be [""]
-    # and num_target_lines is 1, it should produce one "$pkgname:" line.
-    # If text_content is non-empty but results in no words (e.g. "  \n  "),
-    # it should also be handled gracefully.
+    my @paragraphs = split /\n/, $text_content;
 
-    SEGMENT: foreach my $segment (@segments) {
-        last SEGMENT if scalar(@formatted_lines) >= $num_target_lines;
-
-        # Trim whitespace from segment. If it becomes empty, it's a paragraph break.
-        $segment =~ s/^\s+|\s+$//g;
-
-        if ($segment eq "") {
-            push @formatted_lines, $line_prefix_no_space;
-            next SEGMENT;
+    PARAGRAPH: foreach my $paragraph (@paragraphs) {
+        if (scalar(@formatted_lines) >= $num_target_lines) {
+            last PARAGRAPH;
         }
 
-        my @words = split /\s+/, $segment;
-        next SEGMENT if !@words; # Should not happen if segment was non-empty after trim
+        $paragraph =~ s/^\s+|\s+$//g; # Trim whitespace from paragraph
 
-        my $current_line_buffer = ""; # Holds content part of the line
-
-        WORD: foreach my $word (@words) {
-            if (scalar(@formatted_lines) >= $num_target_lines && $current_line_buffer eq "") {
-                 # Already filled target lines and current buffer for this segment is empty
-                last SEGMENT;
+        if ($paragraph eq "") {
+            # This handles intentional paragraph breaks (empty lines in input)
+            if (scalar(@formatted_lines) < $num_target_lines) {
+                push @formatted_lines, $line_prefix_no_space;
             }
-            # Check if a single word itself is too long
+            next PARAGRAPH;
+        }
+
+        my @words = split /\s+/, $paragraph;
+        next PARAGRAPH if !@words; # Skip if paragraph had only whitespace
+
+        my $current_line_content = "";
+
+        foreach my $word (@words) {
+            if (scalar(@formatted_lines) >= $num_target_lines && $current_line_content eq "") {
+                # Target lines reached, and no pending content for the current paragraph line.
+                last PARAGRAPH;
+            }
+            if (scalar(@formatted_lines) >= $num_target_lines && $current_line_content ne "") {
+                # Target lines reached, but there's pending content. Try to push it.
+                # This case should ideally be caught before starting a new word if possible,
+                # but acts as a safeguard.
+                # The main check before adding to @formatted_lines will handle this.
+            }
+
+
+            # Handle very long words: truncate and place on its own line
             if (length($word) > $max_content_len) {
-                # If buffer has content, push it first
-                if ($current_line_buffer ne "") {
-                    last SEGMENT if scalar(@formatted_lines) >= $num_target_lines;
-                    push @formatted_lines, $line_prefix_with_space . $current_line_buffer;
-                    $current_line_buffer = "";
+                # If there's content in the buffer, push it first
+                if ($current_line_content ne "") {
+                    if (scalar(@formatted_lines) < $num_target_lines) {
+                        push @formatted_lines, $line_prefix_with_space . $current_line_content;
+                        $current_line_content = "";
+                    } else {
+                        last PARAGRAPH; # No space for this buffered line
+                    }
                 }
-                # Push the long word, truncated, on its own line
-                last SEGMENT if scalar(@formatted_lines) >= $num_target_lines;
-                push @formatted_lines, $line_prefix_with_space . substr($word, 0, $max_content_len);
-                # The rest of the word is lost, as per typical shell script behavior (often implicit)
-                # Or, decide if $word should become the remainder: $word = substr($word, $max_content_len); and re-evaluate
-                # For now, simply truncating and moving to next word in input.
-                # Given the spec, it's more about fitting, so a very long word will just fill one line.
-                next WORD; # Move to next word, current long word handled.
-            }
-
-            if ($current_line_buffer eq "") {
-                $current_line_buffer = $word;
-            } else {
-                my $potential_line = $current_line_buffer . " " . $word;
-                if (length($potential_line) <= $max_content_len) {
-                    $current_line_buffer = $potential_line;
+                # Now push the truncated long word
+                if (scalar(@formatted_lines) < $num_target_lines) {
+                    push @formatted_lines, $line_prefix_with_space . substr($word, 0, $max_content_len);
                 } else {
-                    last SEGMENT if scalar(@formatted_lines) >= $num_target_lines;
-                    push @formatted_lines, $line_prefix_with_space . $current_line_buffer;
-                    $current_line_buffer = $word;
+                    last PARAGRAPH; # No space for the long word line
+                }
+                next; # Word handled, move to the next word in the paragraph
+            }
+
+            # Regular word processing
+            if ($current_line_content eq "") {
+                $current_line_content = $word;
+            } else {
+                my $potential_content = $current_line_content . " " . $word;
+                if (length($potential_content) <= $max_content_len) {
+                    $current_line_content = $potential_content;
+                } else {
+                    # Word doesn't fit, so push the current line
+                    if (scalar(@formatted_lines) < $num_target_lines) {
+                        push @formatted_lines, $line_prefix_with_space . $current_line_content;
+                        $current_line_content = $word; # Start new line with current word
+                    } else {
+                        # No space for this line, and we have a word that needs to start a new line.
+                        # This means we must stop processing this paragraph.
+                        $current_line_content = ""; # Discard current word as it won't fit
+                        last PARAGRAPH;
+                    }
                 }
             }
-        }# end WORD loop
-        
-        # Push any remaining content in buffer for the current segment
-        if ($current_line_buffer ne "") {
-            last SEGMENT if scalar(@formatted_lines) >= $num_target_lines;
-            push @formatted_lines, $line_prefix_with_space . $current_line_buffer;
+        } # End foreach my $word
+
+        # After processing all words in a paragraph, if there's remaining content, push it
+        if ($current_line_content ne "") {
+            if (scalar(@formatted_lines) < $num_target_lines) {
+                push @formatted_lines, $line_prefix_with_space . $current_line_content;
+            }
+            # If no space, the remaining content of this paragraph is truncated.
         }
+    } # End PARAGRAPH loop
 
-    } # end SEGMENT loop
-
-    # Pad with "$pkgname:" or truncate to meet exactly $num_target_lines
+    # Final padding or truncation to meet exactly $num_target_lines
     while (scalar(@formatted_lines) < $num_target_lines) {
         push @formatted_lines, $line_prefix_no_space;
     }
+    # Ensure that if we overshot, we truncate back to num_target_lines
     if (scalar(@formatted_lines) > $num_target_lines) {
         @formatted_lines = @formatted_lines[0 .. $num_target_lines - 1];
     }
@@ -375,7 +391,7 @@ sub _format_slack_desc {
 	my $pkgname = $this->name() || "unknown"; # Should usually be defined
 	my $summary = $this->summary();
 	my $description = $this->description();
-	my $homepage_url = ""; # Fixed as per requirement
+	# Homepage URL removed as per new requirements
 
 	# Ensure summary is a single, trimmed line
 	$summary = "" if !defined $summary;
@@ -385,7 +401,15 @@ sub _format_slack_desc {
 
 
 	$description = "" if !defined $description;
-    # Newlines in description are paragraph separators, handled by _format_slack_desc_section
+    # Pre-process description to handle newlines for flowing text vs. paragraph breaks
+    # 1. Replace double (or more) newlines with a placeholder
+    $description =~ s/\n\n+/_PARAGRAPH_BREAK_/g;
+    # 2. Replace remaining single newlines with spaces
+    $description =~ s/\n/ /g;
+    # 3. Convert placeholder back to a single newline for actual paragraph breaks
+    $description =~ s/_PARAGRAPH_BREAK_/\n/g;
+    # Now, $description has single newlines only for intended paragraph breaks.
+    # Other newlines that were for readability are now spaces.
 
 	my $screen_width = 72 + length($pkgname);
 
@@ -412,18 +436,12 @@ sub _format_slack_desc {
     $empty_section[0] = "$pkgname:" if @empty_section;
 
 
-	# Section 3: Description (8 lines)
-	my @description_section = _format_slack_desc_section($pkgname, $description, 8, $screen_width);
+	# Section 3: Description (9 lines) - Adjusted from 8 to 9
+	my @description_section = _format_slack_desc_section($pkgname, $description, 9, $screen_width);
 
-	# Section 4: Homepage (1 line)
-	my @homepage_section = _format_slack_desc_section($pkgname, $homepage_url, 1, $screen_width);
-    # Ensure it's just "$pkgname:" if homepage_url is empty
-    if ($homepage_url eq "" && @homepage_section) {
-        $homepage_section[0] = "$pkgname:";
-    }
+	# Section 4: Homepage (REMOVED)
 
-
-	my $all_content_lines = join("\n", @summary_section, @empty_section, @description_section, @homepage_section);
+	my $all_content_lines = join("\n", @summary_section, @empty_section, @description_section);
 	
 	return $complete_ruler_block . $all_content_lines . "\n";
 }
